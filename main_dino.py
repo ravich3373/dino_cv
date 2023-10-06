@@ -33,6 +33,9 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from torch.utils.data import Dataset
+
+from timm.models import create_model
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -47,6 +50,7 @@ def get_args_parser():
                 + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
+    parser.add_argument("--timm_arch", default="")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
         of input square patches - default 16 (for 16x16 patches). Using smaller
         values leads to better performance but requires more memory. Applies only
@@ -129,6 +133,35 @@ def get_args_parser():
     return parser
 
 
+class MyDataset(Dataset):
+
+    def __init__(self, root, transform=None):
+
+        self.X = torch.load(f"{root}/train/X.pt").squeeze(1)
+        self.y = torch.load(f"{root}/train/y.pt").squeeze(1)
+        self.X_v = torch.load(f"{root}/validation/X.pt").squeeze(1)
+        self.y_v = torch.load(f"{root}/validation/y.pt").squeeze(1)
+        self.X_t = torch.load(f"{root}/testing/test.pt").squeeze(1)
+        self.y_t = torch.ones(self.X_t.shape[0])*1000
+
+        self.X = torch.cat((self.X, self.X_v, self.X_t), dim=0)
+        self.y = torch.cat((self.y, self.y_v, self.y_t), dim=0)
+        self.transform = transform
+
+    def __len__(self):
+        return self.X.size(0)
+
+    def __getitem__(self, idx):
+        img =  self.X[idx]#, self.y[idx]
+        img_np = img.permute(1,2,0).numpy()
+        img_int = (((img_np - img_np.min())/(img_np.max()-img_np.min())) * 255).astype(np.uint8)
+        img = Image.fromarray(img_int)
+        img = img.resize((224, 224))
+        if self.transform is not None:
+           img = self.transform(img)
+        return img, self.y[idx]
+
+
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
@@ -142,7 +175,8 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    dataset = MyDataset(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -158,7 +192,18 @@ def train_dino(args):
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
-    if args.arch in vits.__dict__.keys():
+    if args.timm_arch:
+        student = create_model(args.timm_arch)
+        teacher = create_model(args.timm_arch)
+        if "convnext" in args.timm_arch:
+            embed_dim = student.head.fc.weight.shape[1]
+            student.head.fc = nn.Identity()
+            teacher.head.fc = nn.Identity()
+            student.norm_pre = student.head
+            teacher.norm_pre = teacher.head
+        else:
+            embed_dim = student.fc.weight.shape[1]
+    elif args.arch in vits.__dict__.keys():
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
